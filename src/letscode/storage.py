@@ -35,6 +35,41 @@ class ProblemStore:
             "MyApp", "MyCompany"
         ).user_data_path
         self.problems_path = self.data_path / "problems"
+        self.state_path = self.data_path / "state.json"
+
+    def load_last_question_id(self) -> int | None:
+        if not self.state_path.exists():
+            return None
+
+        try:
+            payload = json.loads(self.state_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            return None
+
+        if not isinstance(payload, dict):
+            return None
+
+        try:
+            question_id = int(payload["last_question_id"])
+        except (KeyError, TypeError, ValueError):
+            return None
+
+        return question_id
+
+    def save_last_question_id(self, question_id: int) -> None:
+        self.data_path.mkdir(parents=True, exist_ok=True)
+        temp_path = self.state_path.with_suffix(".json.tmp")
+        temp_path.write_text(
+            json.dumps(
+                {
+                    "last_question_id": question_id,
+                    "updated_at": datetime.now(UTC).isoformat(),
+                },
+                indent=2,
+            ),
+            encoding="utf-8",
+        )
+        temp_path.replace(self.state_path)
 
     def load_problem(self, question_id: int) -> StoredProblem | None:
         path = self._problem_path(question_id)

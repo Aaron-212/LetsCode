@@ -126,6 +126,7 @@ class LetsCodeApp(App):
     TESTFIRE_BUTTON_ID = "testfire-button"
     FULL_TEST_BUTTON_ID = "full-test-button"
     EDIT_BUTTON_ID = "edit-button"
+    REFRESH_JUDGE_BUTTON_ID = "refresh-judge-button"
 
     LOAD_PROBLEM_COMMAND = "/load_problem"
     HINT_COMMAND = "/hint"
@@ -207,6 +208,7 @@ class LetsCodeApp(App):
                 yield ScrollableContainer(
                     Horizontal(
                         Button("Edit", id=self.EDIT_BUTTON_ID),
+                        Button("Refresh", id=self.REFRESH_JUDGE_BUTTON_ID),
                         Button("Testfire", id=self.TESTFIRE_BUTTON_ID),
                         Button("Full", id=self.FULL_TEST_BUTTON_ID),
                         id="judge-buttons",
@@ -245,7 +247,10 @@ class LetsCodeApp(App):
 
     def on_mount(self) -> None:
         self.query_one(self.INPUT_SELECTOR, PromptInput).focus()
-        self.current_problem_id = self.DEFAULT_PROBLEM_ID
+        self.problem_store = ProblemStore()
+        self.current_problem_id = (
+            self.problem_store.load_last_question_id() or self.DEFAULT_PROBLEM_ID
+        )
         self.current_problem_markdown = ""
         self.current_fetched_hints_markdown: list[str] = []
         self.current_generated_hints_markdown: list[str] = []
@@ -319,7 +324,18 @@ class LetsCodeApp(App):
         self.current_judge = None
         self.chat_entries = []
 
-        problem_markdown = await load_problem_markdown(question_id)
+        try:
+            self.problem_store.save_last_question_id(question_id)
+        except OSError as error:
+            self.notify(
+                f"Unable to persist current problem: {error}",
+                severity="warning",
+            )
+
+        problem_markdown = await load_problem_markdown(
+            question_id,
+            store=self.problem_store,
+        )
         self.current_problem_markdown = problem_markdown.problem
         self.current_fetched_hints_markdown = problem_markdown.fetched_hints
         self.current_generated_hints_markdown = [
@@ -392,7 +408,7 @@ class LetsCodeApp(App):
         self.current_generated_hints_markdown.append(hint_markdown)
 
         try:
-            ProblemStore().add_generated_hint(
+            self.problem_store.add_generated_hint(
                 self.current_problem_id,
                 self.current_problem_markdown,
                 self.current_fetched_hints_markdown,
@@ -450,6 +466,11 @@ class LetsCodeApp(App):
             self.run_worker(self.open_solution_editor(), exclusive=True)
             return
 
+        if event.button.id == self.REFRESH_JUDGE_BUTTON_ID:
+            event.stop()
+            self.run_worker(self.refresh_judge(), exclusive=True)
+            return
+
         if event.button.id == self.TESTFIRE_BUTTON_ID:
             event.stop()
             self.run_worker(self.run_judge("testfire"), exclusive=True)
@@ -459,6 +480,16 @@ class LetsCodeApp(App):
             event.stop()
             self.run_worker(self.run_judge("full"), exclusive=True)
             return
+
+    async def refresh_judge(self) -> None:
+        if not self.current_problem_markdown:
+            self.notify("Problem is still loading.", severity="warning")
+            return
+
+        await self.query_one(self.JUDGE_SELECTOR, Markdown).update(
+            "# Judge\n\nRefreshing judge..."
+        )
+        await self.prepare_judge()
 
     async def run_judge(self, suite: JudgeSuite) -> None:
         if not self.current_problem_markdown:
