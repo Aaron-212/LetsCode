@@ -1,6 +1,10 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from typing import Any
+
+from langchain_core.messages import HumanMessage, SystemMessage
+from langchain_openai import ChatOpenAI
 
 from .leetcode import LeetCodeFetcher
 from .markdown import html_to_markdown
@@ -15,6 +19,24 @@ class ProblemMarkdown:
     generated_hints: list[GeneratedHint]
 
 
+CUSTOM_PROBLEM_SYSTEM_PROMPT = """\
+You create original LeetCode-style programming interview questions.
+Return only Markdown, with no surrounding commentary or code fences.
+
+The problem must include:
+- A title as an H1 heading.
+- Difficulty.
+- A clear problem statement.
+- The expected Python Solution method signature.
+- At least two examples with inputs and outputs.
+- Constraints.
+
+Make the question original and consistent with the user's requested topic,
+constraints, or difficulty. Do not copy an existing LeetCode problem. Do not
+include a solution.
+"""
+
+
 async def load_problem_markdown(
     question_id: int = 1,
     *,
@@ -22,6 +44,10 @@ async def load_problem_markdown(
     store: ProblemStore | None = None,
 ) -> ProblemMarkdown:
     problem_store = store or ProblemStore()
+
+    if question_id < 0:
+        return _stored_or_fallback_problem(question_id, problem_store)
+
     problem_fetcher = fetcher or LeetCodeFetcher()
     question = await problem_fetcher.get_problem(question_id)
 
@@ -58,6 +84,32 @@ def format_problem_markdown(question: LeetCodeQuestion) -> tuple[str, list[str]]
     return problem, hints
 
 
+def generate_custom_problem_markdown(
+    prompt: str,
+    model_slug: str = "openai:gpt-5.4-mini",
+    *,
+    model: Any | None = None,
+) -> str:
+    prompt = prompt.strip()
+    if not prompt:
+        raise ValueError("custom problem prompt cannot be empty")
+
+    chat_model = model or ChatOpenAI(model=model_slug)
+    response = chat_model.invoke(
+        [
+            SystemMessage(content=CUSTOM_PROBLEM_SYSTEM_PROMPT),
+            HumanMessage(content=prompt),
+        ]
+    )
+    problem_markdown = _format_message_content(response.content).strip()
+    problem_markdown = _strip_markdown_fence(problem_markdown)
+
+    if not problem_markdown.startswith("#"):
+        problem_markdown = f"# Custom Problem\n\n{problem_markdown}"
+
+    return problem_markdown.strip() + "\n"
+
+
 def _stored_or_fallback_problem(
     question_id: int,
     store: ProblemStore,
@@ -80,3 +132,39 @@ def _problem_from_store(stored_problem: StoredProblem) -> ProblemMarkdown:
         fetched_hints=stored_problem.fetched_hints,
         generated_hints=stored_problem.generated_hints,
     )
+
+
+def _format_message_content(content: Any) -> str:
+    if isinstance(content, str):
+        return content
+
+    if isinstance(content, list):
+        return "\n".join(_format_content_part(item) for item in content)
+
+    return str(content)
+
+
+def _format_content_part(item: Any) -> str:
+    if isinstance(item, str):
+        return item
+
+    if isinstance(item, dict) and "text" in item:
+        return str(item["text"])
+
+    return str(item)
+
+
+def _strip_markdown_fence(markdown: str) -> str:
+    cleaned = markdown.strip()
+    if not cleaned.startswith("```"):
+        return cleaned
+
+    first_line_end = cleaned.find("\n")
+    if first_line_end == -1:
+        return cleaned
+
+    cleaned = cleaned[first_line_end + 1 :]
+    if cleaned.endswith("```"):
+        cleaned = cleaned[:-3]
+
+    return cleaned.strip()

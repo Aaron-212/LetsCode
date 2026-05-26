@@ -84,6 +84,22 @@ class ProblemStore:
 
         return self._decode_problem(payload)
 
+    def next_custom_question_id(self) -> int:
+        if not self.problems_path.exists():
+            return -1
+
+        custom_question_ids = []
+        for path in self.problems_path.glob("*.json"):
+            try:
+                question_id = int(path.stem)
+            except ValueError:
+                continue
+
+            if question_id < 0:
+                custom_question_ids.append(question_id)
+
+        return min(custom_question_ids, default=0) - 1
+
     def save_fetched_problem(
         self,
         question_id: int,
@@ -96,6 +112,23 @@ class ProblemStore:
             question_id=question_id,
             problem=problem,
             fetched_hints=fetched_hints,
+            generated_hints=generated_hints,
+        )
+        self._save_problem(stored_problem)
+        return stored_problem
+
+    def save_generated_problem(
+        self,
+        question_id: int,
+        problem: str,
+        fetched_hints: list[str] | None = None,
+    ) -> StoredProblem:
+        existing = self.load_problem(question_id)
+        generated_hints = existing.generated_hints if existing else []
+        stored_problem = StoredProblem(
+            question_id=question_id,
+            problem=problem,
+            fetched_hints=fetched_hints or [],
             generated_hints=generated_hints,
         )
         self._save_problem(stored_problem)

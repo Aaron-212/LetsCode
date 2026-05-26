@@ -1,16 +1,23 @@
 import asyncio
 import unittest
+from types import SimpleNamespace
 
 from letscode.model.leetcode import LeetCodeQuestion
-from letscode.problem import format_problem_markdown, load_problem_markdown
+from letscode.problem import (
+    format_problem_markdown,
+    generate_custom_problem_markdown,
+    load_problem_markdown,
+)
 from letscode.storage import GeneratedHint, StoredProblem
 
 
 class FakeFetcher:
     def __init__(self, question: LeetCodeQuestion | None) -> None:
         self.question = question
+        self.called = False
 
     async def get_problem(self, question_id: int) -> LeetCodeQuestion | None:
+        self.called = True
         return self.question
 
 
@@ -34,6 +41,16 @@ class FakeStore:
             generated_hints=[],
         )
         return self.stored_problem
+
+
+class FakeModel:
+    def __init__(self, content: str) -> None:
+        self.content = content
+        self.messages = None
+
+    def invoke(self, messages: object) -> SimpleNamespace:
+        self.messages = messages
+        return SimpleNamespace(content=self.content)
 
 
 class ProblemMarkdownTest(unittest.TestCase):
@@ -86,6 +103,41 @@ class ProblemMarkdownTest(unittest.TestCase):
         self.assertIn("# Problem 99", result.problem)
         self.assertEqual(result.fetched_hints, [result.problem])
         self.assertEqual(result.generated_hints, [])
+
+    def test_load_custom_problem_uses_store_without_fetching(self) -> None:
+        stored_problem = StoredProblem(
+            question_id=-1,
+            problem="# Custom",
+            fetched_hints=[],
+            generated_hints=[],
+        )
+        fetcher = FakeFetcher(None)
+
+        result = asyncio.run(
+            load_problem_markdown(
+                -1,
+                fetcher=fetcher,
+                store=FakeStore(stored_problem),
+            )
+        )
+
+        self.assertEqual(result.problem, "# Custom")
+        self.assertFalse(fetcher.called)
+
+    def test_generate_custom_problem_markdown_normalizes_model_output(self) -> None:
+        model = FakeModel("```markdown\n# Prefix Windows\n\nDifficulty: Medium\n```")
+
+        result = generate_custom_problem_markdown(
+            "strings with prefix constraints",
+            model=model,
+        )
+
+        self.assertEqual(result, "# Prefix Windows\n\nDifficulty: Medium\n")
+        self.assertIsNotNone(model.messages)
+
+    def test_generate_custom_problem_markdown_rejects_empty_prompt(self) -> None:
+        with self.assertRaises(ValueError):
+            generate_custom_problem_markdown(" ", model=FakeModel("# Unused"))
 
 
 if __name__ == "__main__":

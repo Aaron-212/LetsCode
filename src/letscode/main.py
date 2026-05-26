@@ -33,7 +33,11 @@ from .judge import (
     is_judge_suite,
     run_solution_suite,
 )
-from .problem import load_problem_markdown
+from .problem import (
+    ProblemMarkdown,
+    generate_custom_problem_markdown,
+    load_problem_markdown,
+)
 from .solution import (
     editor_command,
     ensure_solution_file,
@@ -51,6 +55,13 @@ ChatRole = Literal["user", "agent"]
 class ChatEntry:
     role: ChatRole
     content: str
+
+
+def parse_question_id(value: str) -> int | None:
+    try:
+        return int(value)
+    except ValueError:
+        return None
 
 
 class ChatBubble(Horizontal):
@@ -128,7 +139,8 @@ class LetsCodeApp(App):
     EDIT_BUTTON_ID = "edit-button"
     REFRESH_JUDGE_BUTTON_ID = "refresh-judge-button"
 
-    LOAD_PROBLEM_COMMAND = "/load_problem"
+    LOAD_PROBLEM_COMMAND = "/problem"
+    NEW_COMMAND = "/new"
     HINT_COMMAND = "/hint"
     FIX_COMMAND = "/fix"
     RESET_COMMAND = "/reset"
@@ -167,12 +179,12 @@ class LetsCodeApp(App):
 
     .chat-bubble.user {
         background: $primary 20%;
-        border-left: $primary thick;
+        border-left: $primary tall;
     }
 
     .chat-bubble.agent {
         background: $surface;
-        border-left: $foreground thick;
+        border-left: $foreground tall;
     }
 
     .chat-empty {
@@ -264,10 +276,14 @@ class LetsCodeApp(App):
         self.run_worker(self.load_problem(self.current_problem_id), exclusive=True)
 
     def handle_slash_command(self, message: str) -> bool:
-        command, *args = message.split()
+        command, _, arg_text = message.partition(" ")
+        args = arg_text.split()
 
         if command == self.LOAD_PROBLEM_COMMAND:
             return self._handle_load_problem_command(args)
+
+        if command == self.NEW_COMMAND:
+            return self._handle_new_command(arg_text.strip())
 
         if command == self.HINT_COMMAND:
             return self._handle_hint_command(args)
@@ -282,14 +298,25 @@ class LetsCodeApp(App):
 
     def _handle_load_problem_command(self, args: list[str]) -> bool:
         if not args:
+            self.notify(f"Loading problem {self.current_problem_id}...")
             self.action_load_problem()
             return True
 
-        if len(args) == 1 and args[0].isdigit():
-            self.run_worker(self.load_problem(int(args[0])), exclusive=True)
+        question_id = parse_question_id(args[0]) if len(args) == 1 else None
+        if question_id is not None:
+            self.notify(f"Loading problem {question_id}...")
+            self.run_worker(self.load_problem(question_id), exclusive=True)
             return True
 
-        self.notify("Usage: /load_problem [question_id]", severity="warning")
+        self.notify("Usage: /problem [question_id]", severity="warning")
+        return True
+
+    def _handle_new_command(self, prompt: str) -> bool:
+        if not prompt:
+            self.notify("Usage: /new [PROMPT]", severity="warning")
+            return True
+
+        self.run_worker(self.create_problem(prompt), exclusive=True)
         return True
 
     def _handle_hint_command(self, args: list[str]) -> bool:
@@ -310,15 +337,73 @@ class LetsCodeApp(App):
         return True
 
     def _handle_reset_command(self, args: list[str]) -> bool:
-        if len(args) > 1 or (args and not args[0].isdigit()):
+        question_id = parse_question_id(args[0]) if len(args) == 1 else None
+        if len(args) > 1 or (args and question_id is None):
             self.notify("Usage: /reset [question_id]", severity="warning")
             return True
 
-        question_id = int(args[0]) if args else None
         self.run_worker(self.reset_solution(question_id), exclusive=True)
         return True
 
     async def load_problem(self, question_id: int) -> None:
+        problem_markdown = await load_problem_markdown(
+            question_id,
+            store=self.problem_store,
+        )
+        await self.activate_problem(question_id, problem_markdown)
+
+    async def create_problem(self, prompt: str) -> None:
+        self.notify("Generating new problem...")
+        await self.query_one(self.PROBLEM_SELECTOR, Markdown).update(
+            "# New Problem\n\nGenerating a custom problem from your prompt..."
+        )
+        await self._update_solution_preview("")
+        await self.query_one(self.JUDGE_SELECTOR, Markdown).update(
+            "# Judge\n\nWaiting for the new problem..."
+        )
+
+        try:
+            model_slug = os.getenv("LETSCODE_AGENT_MODEL", self.DEFAULT_AGENT_MODEL)
+            problem = await asyncio.to_thread(
+                generate_custom_problem_markdown,
+                prompt,
+                model_slug,
+            )
+        except Exception as error:
+            await self.query_one(self.JUDGE_SELECTOR, Markdown).update(
+                f"# Judge\n\nUnable to generate new problem: `{error}`"
+            )
+            self.notify(f"Unable to generate new problem: {error}", severity="error")
+            return
+
+        question_id = self.problem_store.next_custom_question_id()
+        try:
+            stored_problem = self.problem_store.save_generated_problem(
+                question_id,
+                problem,
+            )
+        except OSError as error:
+            self.notify(f"Unable to persist new problem: {error}", severity="warning")
+            problem_markdown = ProblemMarkdown(
+                problem=problem,
+                fetched_hints=[],
+                generated_hints=[],
+            )
+        else:
+            problem_markdown = ProblemMarkdown(
+                problem=stored_problem.problem,
+                fetched_hints=stored_problem.fetched_hints,
+                generated_hints=stored_problem.generated_hints,
+            )
+
+        await self.activate_problem(question_id, problem_markdown)
+        self.notify(f"Generated custom problem {question_id}.")
+
+    async def activate_problem(
+        self,
+        question_id: int,
+        problem_markdown: ProblemMarkdown,
+    ) -> None:
         self.current_problem_id = question_id
         self.agent = None
         self.current_judge = None
@@ -332,10 +417,6 @@ class LetsCodeApp(App):
                 severity="warning",
             )
 
-        problem_markdown = await load_problem_markdown(
-            question_id,
-            store=self.problem_store,
-        )
         self.current_problem_markdown = problem_markdown.problem
         self.current_fetched_hints_markdown = problem_markdown.fetched_hints
         self.current_generated_hints_markdown = [

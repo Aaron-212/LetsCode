@@ -1,6 +1,6 @@
 import unittest
 
-from letscode.main import ChatBubble, ChatEntry
+from letscode.main import ChatBubble, ChatEntry, parse_question_id
 
 
 class ChatBubbleTest(unittest.TestCase):
@@ -19,6 +19,14 @@ class ChatBubbleTest(unittest.TestCase):
 
         self.assertTrue(bubble.has_class("agent"))
         self.assertTrue(child.has_class("agent"))
+
+
+class ParseQuestionIdTest(unittest.TestCase):
+    def test_parse_question_id_accepts_custom_negative_ids(self) -> None:
+        self.assertEqual(parse_question_id("-1"), -1)
+
+    def test_parse_question_id_rejects_non_integer_values(self) -> None:
+        self.assertIsNone(parse_question_id("two-sum"))
 
 
 if __name__ == "__main__":

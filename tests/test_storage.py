@@ -27,6 +27,30 @@ class ProblemStoreStateTest(unittest.TestCase):
 
             self.assertIsNone(store.load_last_question_id())
 
+    def test_save_and_load_generated_problem(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            store = ProblemStore(Path(directory))
+
+            store.save_generated_problem(-1, "# Custom Problem")
+            stored_problem = store.load_problem(-1)
+
+            self.assertIsNotNone(stored_problem)
+            self.assertEqual(stored_problem.question_id, -1)
+            self.assertEqual(stored_problem.problem, "# Custom Problem")
+            self.assertEqual(stored_problem.fetched_hints, [])
+
+    def test_next_custom_question_id_counts_down(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            store = ProblemStore(Path(directory))
+
+            self.assertEqual(store.next_custom_question_id(), -1)
+
+            store.save_generated_problem(-1, "# First")
+            store.save_generated_problem(-2, "# Second")
+            store.save_fetched_problem(1, "# LeetCode", [])
+
+            self.assertEqual(store.next_custom_question_id(), -3)
+
 
 if __name__ == "__main__":
     unittest.main()

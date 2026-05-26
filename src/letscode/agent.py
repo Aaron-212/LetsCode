@@ -24,7 +24,7 @@ class LetsCodeAgentState:
 
 class LetsCodeAgent:
     SYSTEM_PROMPT = """\
-    You are a helpful LeetCode assistant.
+    You are a helpful coding-problem assistant.
 
     You have access to tools for the currently loaded problem:
     - get_current_problem_context: read the active problem statement and metadata.
@@ -89,7 +89,7 @@ class LetsCodeAgent:
         prompt_suffix = f"\nUser focus: {user_prompt}" if user_prompt else ""
         hint = self._invoke(
             "Generate one additional concise, progressive hint for the current "
-            "LeetCode problem. Use the current-problem tools for context. Do not "
+            "coding problem. Use the current-problem tools for context. Do not "
             "include full code or solve the problem outright."
             f"{prompt_suffix}"
         )
@@ -99,7 +99,7 @@ class LetsCodeAgent:
     def fix_solution(self, suite: str) -> str:
         self.state.attempts_count += 1
         response = self._invoke(
-            "Fix the current Python solution for the active LeetCode problem. "
+            "Fix the current Python solution for the active coding problem. "
             f"The failing suite is {suite}. Use the current-problem, current-solution, "
             "and judge-output tools before answering. Return only corrected Python "
             "code for the complete solution file, with no Markdown fences or explanation."
@@ -164,9 +164,9 @@ def extract_python_code(content: str) -> str:
 def tool_factory(state: LetsCodeAgentState) -> list[BaseTool]:
     @tool
     def get_current_problem_context() -> str:
-        """Return the active LeetCode problem statement and metadata."""
+        """Return the active coding problem statement and metadata."""
         if not state.problem_markdown:
-            return "No LeetCode problem is currently loaded."
+            return "No coding problem is currently loaded."
 
         metadata = []
         if state.current_problem_id is not None:
