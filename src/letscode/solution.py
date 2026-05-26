@@ -18,6 +18,11 @@ def ensure_solution_file(path: Path, initial_code: str) -> Path:
     return path
 
 
+def reset_solution_file(path: Path, initial_code: str) -> Path:
+    write_solution_file(path, initial_code)
+    return path
+
+
 def write_solution_file(path: Path, solution_code: str) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(solution_code, encoding="utf-8")

@@ -1,7 +1,9 @@
 import asyncio
 import os
 import subprocess
+from dataclasses import dataclass
 from pathlib import Path
+from typing import Literal
 
 from dotenv import load_dotenv
 from textual.app import App, ComposeResult
@@ -14,6 +16,7 @@ from textual.widgets import (
     Footer,
     Header,
     Markdown,
+    Static,
     TabbedContent,
     TabPane,
     TextArea,
@@ -35,10 +38,35 @@ from .solution import (
     editor_command,
     ensure_solution_file,
     read_solution_file,
+    reset_solution_file,
     solution_path,
     write_solution_file,
 )
 from .storage import GeneratedHint, ProblemStore
+
+ChatRole = Literal["user", "agent"]
+
+
+@dataclass(frozen=True)
+class ChatEntry:
+    role: ChatRole
+    content: str
+
+
+class ChatBubble(Horizontal):
+    """A single chat message row."""
+
+    def __init__(self, entry: ChatEntry) -> None:
+        super().__init__(classes=f"chat-row {entry.role}")
+        self.entry = entry
+
+    def compose(self) -> ComposeResult:
+        content = self.entry.content.strip() or "No content."
+        yield Static(
+            content,
+            classes=f"chat-bubble {self.entry.role}",
+            markup=False,
+        )
 
 
 class PromptInput(TextArea):
@@ -92,6 +120,8 @@ class LetsCodeApp(App):
     HINTS_SELECTOR = "#hints"
     JUDGE_SELECTOR = "#judge-output"
     SOLUTION_PREVIEW_SELECTOR = "#solution-preview"
+    CHAT_CONTAINER_SELECTOR = "#chat"
+    CHAT_TAB_ID = "chat-tab"
 
     TESTFIRE_BUTTON_ID = "testfire-button"
     FULL_TEST_BUTTON_ID = "full-test-button"
@@ -100,6 +130,7 @@ class LetsCodeApp(App):
     LOAD_PROBLEM_COMMAND = "/load_problem"
     HINT_COMMAND = "/hint"
     FIX_COMMAND = "/fix"
+    RESET_COMMAND = "/reset"
 
     CSS = """\
     Screen {
@@ -117,9 +148,35 @@ class LetsCodeApp(App):
         padding: 1;
     }
 
-    #problem, #hints, #judge-output, #solution-preview {
+    #problem, #hints, #judge-output, #solution-preview, #chat {
         height: auto;
         background: transparent;
+    }
+
+    .chat-row {
+        height: auto;
+        width: 100%;
+        margin-bottom: 1;
+    }
+
+    .chat-bubble {
+        height: auto;
+        padding: 1;
+    }
+
+    .chat-bubble.user {
+        background: $primary 20%;
+        border-left: $primary thick;
+    }
+
+    .chat-bubble.agent {
+        background: $surface;
+        border-left: $foreground thick;
+    }
+
+    .chat-empty {
+        height: auto;
+        color: $text-muted;
     }
 
     #judge-buttons {
@@ -165,9 +222,21 @@ class LetsCodeApp(App):
                     Markdown("# Loading problem..."),
                     id="hints",
                 )
+            with TabPane("Chat", id=self.CHAT_TAB_ID):
+                yield ScrollableContainer(
+                    Static(
+                        "No messages yet. Type a question or request below.",
+                        classes="chat-empty",
+                        markup=False,
+                    ),
+                    id="chat",
+                )
         yield PromptInput(
             language="markdown",
-            placeholder="Type your commands. Enter submits, Alt+Enter adds a new line.",
+            placeholder=(
+                "Ask the agent or type a command. Enter submits, Alt+Enter adds "
+                "a new line."
+            ),
             id="input",
             compact=True,
             highlight_cursor_line=False,
@@ -181,6 +250,7 @@ class LetsCodeApp(App):
         self.current_fetched_hints_markdown: list[str] = []
         self.current_generated_hints_markdown: list[str] = []
         self.generated_hints_count = 0
+        self.chat_entries: list[ChatEntry] = []
         self.agent: LetsCodeAgent | None = None
         self.current_judge: GeneratedJudge | None = None
         self.action_load_problem()
@@ -199,6 +269,9 @@ class LetsCodeApp(App):
 
         if command == self.FIX_COMMAND:
             return self._handle_fix_command(args)
+
+        if command == self.RESET_COMMAND:
+            return self._handle_reset_command(args)
 
         return False
 
@@ -231,10 +304,20 @@ class LetsCodeApp(App):
         self.run_worker(self.fix_solution(suite), exclusive=True)
         return True
 
+    def _handle_reset_command(self, args: list[str]) -> bool:
+        if len(args) > 1 or (args and not args[0].isdigit()):
+            self.notify("Usage: /reset [question_id]", severity="warning")
+            return True
+
+        question_id = int(args[0]) if args else None
+        self.run_worker(self.reset_solution(question_id), exclusive=True)
+        return True
+
     async def load_problem(self, question_id: int) -> None:
         self.current_problem_id = question_id
         self.agent = None
         self.current_judge = None
+        self.chat_entries = []
 
         problem_markdown = await load_problem_markdown(question_id)
         self.current_problem_markdown = problem_markdown.problem
@@ -255,6 +338,7 @@ class LetsCodeApp(App):
             problem_markdown.fetched_hints,
             problem_markdown.generated_hints,
         )
+        await self._render_chat_log()
         await self.prepare_judge()
 
     async def _render_hints(
@@ -502,6 +586,55 @@ class LetsCodeApp(App):
         else:
             self.notify("Fix written, but tests still fail.", severity="warning")
 
+    async def reset_solution(self, question_id: int | None = None) -> None:
+        if question_id is None and not self.current_problem_markdown:
+            self.notify("Problem is still loading.", severity="warning")
+            return
+
+        target_question_id = (
+            self.current_problem_id if question_id is None else question_id
+        )
+        is_current_problem = target_question_id == self.current_problem_id and bool(
+            self.current_problem_markdown
+        )
+
+        judge_output = self.query_one(self.JUDGE_SELECTOR, Markdown)
+        await judge_output.update(
+            f"# Judge\n\nResetting solution for problem {target_question_id}..."
+        )
+
+        try:
+            if is_current_problem:
+                judge = await self._ensure_judge()
+            else:
+                problem_markdown = await load_problem_markdown(target_question_id)
+                model_slug = os.getenv("LETSCODE_AGENT_MODEL", self.DEFAULT_AGENT_MODEL)
+                judge = await asyncio.to_thread(
+                    generate_judge,
+                    problem_markdown.problem,
+                    model_slug,
+                )
+
+            path = solution_path(judge)
+            reset_solution_file(path, judge.initial_code_snippet)
+        except Exception as error:
+            await judge_output.update(f"# Judge\n\nUnable to reset solution: `{error}`")
+            self.notify(f"Unable to reset solution: {error}", severity="error")
+            return
+
+        if is_current_problem:
+            await self._update_solution_preview(judge.initial_code_snippet, path)
+            if self.agent is not None:
+                self.agent.set_solution_context(
+                    solution_code=judge.initial_code_snippet,
+                    judge_output="",
+                )
+
+        await judge_output.update(
+            f"# Judge\n\nReset solution for problem {target_question_id} at `{path}`."
+        )
+        self.notify(f"Reset solution for problem {target_question_id}.")
+
     async def open_solution_editor(self) -> None:
         if not self.current_problem_markdown:
             self.notify("Problem is still loading.", severity="warning")
@@ -604,6 +737,53 @@ class LetsCodeApp(App):
             f"{label}\n\n```python\n{preview}\n```"
         )
 
+    async def chat_with_agent(self, message: str) -> None:
+        if not self.current_problem_markdown:
+            self.notify("Problem is still loading.", severity="warning")
+            return
+
+        self.chat_entries.append(ChatEntry("user", message))
+        pending_index = len(self.chat_entries)
+        self.chat_entries.append(ChatEntry("agent", "Thinking..."))
+        self.query_one(TabbedContent).active = self.CHAT_TAB_ID
+        await self._render_chat_log()
+
+        try:
+            response = await asyncio.to_thread(self.get_agent().chat, message)
+        except Exception as error:
+            self.chat_entries[pending_index] = ChatEntry(
+                "agent",
+                f"Unable to get a response: {error}",
+            )
+            await self._render_chat_log()
+            self.notify(f"Unable to chat with agent: {error}", severity="error")
+            return
+
+        self.chat_entries[pending_index] = ChatEntry("agent", response)
+        await self._render_chat_log()
+
+    async def _render_chat_log(self) -> None:
+        chat_container = self.query_one(
+            self.CHAT_CONTAINER_SELECTOR,
+            ScrollableContainer,
+        )
+        await chat_container.remove_children()
+
+        if not self.chat_entries:
+            await chat_container.mount(
+                Static(
+                    "No messages yet. Type a question or request below.",
+                    classes="chat-empty",
+                    markup=False,
+                )
+            )
+        else:
+            await chat_container.mount(
+                *(ChatBubble(entry) for entry in self.chat_entries)
+            )
+
+        chat_container.scroll_end(animate=False)
+
     async def on_prompt_input_submitted(self, event: PromptInput.Submitted) -> None:
         """Handle user input."""
         input_widget = self.query_one(self.INPUT_SELECTOR, PromptInput)
@@ -617,6 +797,8 @@ class LetsCodeApp(App):
 
         if message.startswith("/") and self.handle_slash_command(message):
             return
+
+        self.run_worker(self.chat_with_agent(message), exclusive=True)
 
 
 def main() -> None:

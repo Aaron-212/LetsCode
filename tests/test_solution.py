@@ -6,6 +6,7 @@ from letscode.solution import (
     editor_command,
     ensure_solution_file,
     read_solution_file,
+    reset_solution_file,
     write_solution_file,
 )
 
@@ -27,6 +28,15 @@ class SolutionFileTest(unittest.TestCase):
             write_solution_file(path, "class Solution:\n    pass\n")
 
             self.assertEqual(read_solution_file(path), "class Solution:\n    pass\n")
+
+    def test_reset_solution_file_overwrites_existing_solution(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "nested" / "solution.py"
+
+            write_solution_file(path, "custom\n")
+            reset_solution_file(path, "initial\n")
+
+            self.assertEqual(read_solution_file(path), "initial\n")
 
     def test_editor_command_splits_configured_editor(self) -> None:
         path = Path("/tmp/solution.py")
