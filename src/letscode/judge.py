@@ -6,13 +6,18 @@ from dataclasses import asdict, dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
 from types import ModuleType
-from typing import Any
+from typing import Any, Literal, TypeGuard
 
 from langchain_core.messages import HumanMessage, SystemMessage
 from langchain_openai import ChatOpenAI
 from platformdirs import PlatformDirs
 
 from .agent import format_message_content
+
+
+JudgeSuite = Literal["testfire", "full"]
+DEFAULT_JUDGE_SUITE: JudgeSuite = "testfire"
+VALID_JUDGE_SUITES: tuple[JudgeSuite, ...] = ("testfire", "full")
 
 
 @dataclass(frozen=True)
@@ -141,6 +146,51 @@ def run_testfire(solution_code: str, judge: GeneratedJudge) -> JudgeRun:
 
 def run_full_suite(solution_code: str, judge: GeneratedJudge) -> JudgeRun:
     return run_generated_tests(solution_code, judge, suites=("full",))
+
+
+def is_judge_suite(value: str) -> TypeGuard[JudgeSuite]:
+    return value in VALID_JUDGE_SUITES
+
+
+def run_solution_suite(
+    suite: JudgeSuite,
+    solution_code: str,
+    judge: GeneratedJudge,
+) -> JudgeRun:
+    if suite == "testfire":
+        return run_testfire(solution_code, judge)
+    if suite == "full":
+        return run_full_suite(solution_code, judge)
+
+    raise ValueError(f"Unknown judge suite: {suite}")
+
+
+def format_judge_run(suite: JudgeSuite, run: JudgeRun) -> str:
+    lines = [
+        "# Judge",
+        "",
+        f"{suite.title()} tests: {'passed' if run.passed else 'failed'}",
+    ]
+
+    for result in run.results:
+        state = "passed" if result.passed else "failed"
+        lines.extend(["", f"## {result.suite}: {state}"])
+        if result.message:
+            lines.extend(["", result.message])
+        if result.error:
+            lines.extend(["", "```text", result.error.strip(), "```"])
+
+    return "\n".join(lines)
+
+
+def format_judge_error(suite: JudgeSuite, error: Exception) -> str:
+    return (
+        "# Judge\n\n"
+        f"{suite.title()} tests: error\n\n"
+        "```text\n"
+        f"{type(error).__name__}: {error}\n"
+        "```"
+    )
 
 
 def run_generated_tests(

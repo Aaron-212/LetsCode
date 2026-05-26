@@ -1,11 +1,15 @@
 from __future__ import annotations
 
+import logging
 from typing import Any
 
 import httpx
 
 from .constants import USER_AGENT
 from .model.leetcode import LeetCodeQuestion, LeetCodeQuestionList
+
+
+logger = logging.getLogger(__name__)
 
 
 class LeetCodeFetcher:
@@ -42,15 +46,24 @@ class LeetCodeFetcher:
     ) -> httpx.Response | None:
         headers = {"User-Agent": USER_AGENT, "Content-Type": "application/json"}
 
-        async with httpx.AsyncClient(
-            base_url=self.base_url,
-            headers=headers,
-            timeout=self.REQUEST_TIMEOUT,
-        ) as client:
-            response = await client.request(method, path, **kwargs)
+        try:
+            async with httpx.AsyncClient(
+                base_url=self.base_url,
+                headers=headers,
+                timeout=self.REQUEST_TIMEOUT,
+            ) as client:
+                response = await client.request(method, path, **kwargs)
+        except httpx.HTTPError as error:
+            logger.warning("LeetCode request failed: %s %s: %s", method, path, error)
+            return None
 
         if response.status_code != httpx.codes.OK:
-            print("Error:", response.status_code)
+            logger.warning(
+                "LeetCode request returned %s: %s %s",
+                response.status_code,
+                method,
+                path,
+            )
             return None
 
         return response

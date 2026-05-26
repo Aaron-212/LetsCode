@@ -1,8 +1,6 @@
 import asyncio
 import os
-import shlex
 import subprocess
-from dataclasses import dataclass
 from pathlib import Path
 
 from dotenv import load_dotenv
@@ -23,78 +21,24 @@ from textual.widgets import (
 
 from .agent import LetsCodeAgent
 from .judge import (
+    DEFAULT_JUDGE_SUITE,
     GeneratedJudge,
-    default_data_path,
+    JudgeSuite,
+    format_judge_error,
+    format_judge_run,
     generate_judge,
-    run_full_suite,
-    run_testfire,
+    is_judge_suite,
+    run_solution_suite,
 )
-from .leetcode import LeetCodeFetcher
-from .markdown import html_to_markdown
+from .problem import load_problem_markdown
+from .solution import (
+    editor_command,
+    ensure_solution_file,
+    read_solution_file,
+    solution_path,
+    write_solution_file,
+)
 from .storage import GeneratedHint, ProblemStore
-
-
-@dataclass(frozen=True)
-class ProblemMarkdown:
-    problem: str
-    fetched_hints: list[str]
-    generated_hints: list[GeneratedHint]
-
-
-async def load_problem_markdown(
-    question_id: int = 1,
-) -> tuple[str, list[str], list[GeneratedHint]]:
-    problem_markdown = await fetch_problem_markdown(question_id)
-    return (
-        problem_markdown.problem,
-        problem_markdown.fetched_hints,
-        problem_markdown.generated_hints,
-    )
-
-
-async def fetch_problem_markdown(question_id: int = 1) -> ProblemMarkdown:
-    store = ProblemStore()
-    question = await LeetCodeFetcher().get_problem(question_id)
-
-    if question is None:
-        stored_problem = store.load_problem(question_id)
-        if stored_problem is not None:
-            return ProblemMarkdown(
-                problem=stored_problem.problem,
-                fetched_hints=stored_problem.fetched_hints,
-                generated_hints=stored_problem.generated_hints,
-            )
-
-        fallback_markdown = f"# Problem {question_id}\n\nUnable to load this problem."
-        return ProblemMarkdown(
-            problem=fallback_markdown,
-            fetched_hints=[fallback_markdown],
-            generated_hints=[],
-        )
-
-    content = html_to_markdown(question.content)
-    hints = [html_to_markdown(hint) for hint in question.hints]
-    problem = (
-        f"# {question.questionId}. {question.title}\n\n"
-        f"Difficulty: {question.difficulty}\n\n"
-        f"{content}"
-    )
-    try:
-        stored_problem = store.save_fetched_problem(question.questionId, problem, hints)
-    except OSError:
-        stored_problem = store.load_problem(question.questionId)
-        if stored_problem is None:
-            return ProblemMarkdown(
-                problem=problem,
-                fetched_hints=hints,
-                generated_hints=[],
-            )
-
-    return ProblemMarkdown(
-        problem=stored_problem.problem,
-        fetched_hints=stored_problem.fetched_hints,
-        generated_hints=stored_problem.generated_hints,
-    )
 
 
 class PromptInput(TextArea):
@@ -239,7 +183,6 @@ class LetsCodeApp(App):
         self.generated_hints_count = 0
         self.agent: LetsCodeAgent | None = None
         self.current_judge: GeneratedJudge | None = None
-        self.current_solution_path: Path | None = None
         self.action_load_problem()
 
     def action_load_problem(self) -> None:
@@ -280,37 +223,38 @@ class LetsCodeApp(App):
         return True
 
     def _handle_fix_command(self, args: list[str]) -> bool:
-        if len(args) > 1 or (args and args[0] not in {"testfire", "full"}):
+        suite = args[0] if args else DEFAULT_JUDGE_SUITE
+        if len(args) > 1 or not is_judge_suite(suite):
             self.notify("Usage: /fix [testfire|full]", severity="warning")
             return True
 
-        self.run_worker(
-            self.fix_solution(args[0] if args else "testfire"), exclusive=True
-        )
+        self.run_worker(self.fix_solution(suite), exclusive=True)
         return True
 
     async def load_problem(self, question_id: int) -> None:
         self.current_problem_id = question_id
         self.agent = None
         self.current_judge = None
-        self.current_solution_path = None
 
-        (
-            problem_markdown,
-            fetched_hints_markdown,
-            generated_hints,
-        ) = await load_problem_markdown(question_id)
-        self.current_problem_markdown = problem_markdown
-        self.current_fetched_hints_markdown = fetched_hints_markdown
-        self.current_generated_hints_markdown = [hint.hint for hint in generated_hints]
-        self.generated_hints_count = len(generated_hints)
+        problem_markdown = await load_problem_markdown(question_id)
+        self.current_problem_markdown = problem_markdown.problem
+        self.current_fetched_hints_markdown = problem_markdown.fetched_hints
+        self.current_generated_hints_markdown = [
+            hint.hint for hint in problem_markdown.generated_hints
+        ]
+        self.generated_hints_count = len(problem_markdown.generated_hints)
 
-        await self.query_one(self.PROBLEM_SELECTOR, Markdown).update(problem_markdown)
+        await self.query_one(self.PROBLEM_SELECTOR, Markdown).update(
+            problem_markdown.problem
+        )
         await self._update_solution_preview("")
         await self.query_one(self.JUDGE_SELECTOR, Markdown).update(
             "# Judge\n\nGenerating judge from the current problem..."
         )
-        await self._render_hints(fetched_hints_markdown, generated_hints)
+        await self._render_hints(
+            problem_markdown.fetched_hints,
+            problem_markdown.generated_hints,
+        )
         await self.prepare_judge()
 
     async def _render_hints(
@@ -432,7 +376,7 @@ class LetsCodeApp(App):
             self.run_worker(self.run_judge("full"), exclusive=True)
             return
 
-    async def run_judge(self, suite: str) -> None:
+    async def run_judge(self, suite: JudgeSuite) -> None:
         if not self.current_problem_markdown:
             self.notify("Problem is still loading.", severity="warning")
             return
@@ -447,35 +391,28 @@ class LetsCodeApp(App):
             self.notify(f"Unable to generate judge: {error}", severity="error")
             return
 
-        path = self._solution_path(judge)
-        if not path.exists():
-            self._write_solution_file(path, judge.initial_code_snippet)
+        path = solution_path(judge)
+        ensure_solution_file(path, judge.initial_code_snippet)
 
         await judge_output.update(f"# Judge\n\nRunning {suite} tests...")
 
         try:
-            solution_code = path.read_text(encoding="utf-8")
-            if suite == "testfire":
-                run = await asyncio.to_thread(
-                    run_testfire,
-                    solution_code,
-                    judge,
-                )
-            else:
-                run = await asyncio.to_thread(
-                    run_full_suite,
-                    solution_code,
-                    judge,
-                )
+            solution_code = read_solution_file(path)
+            run = await asyncio.to_thread(
+                run_solution_suite,
+                suite,
+                solution_code,
+                judge,
+            )
         except Exception as error:
             await judge_output.update(f"# Judge\n\nUnable to run tests: `{error}`")
             self.notify(f"Unable to run tests: {error}", severity="error")
             return
 
-        await judge_output.update(self._format_judge_run(suite, run))
-        await self._update_solution_preview(path.read_text(encoding="utf-8"), path)
+        await judge_output.update(format_judge_run(suite, run))
+        await self._update_solution_preview(solution_code, path)
 
-    async def fix_solution(self, suite: str) -> None:
+    async def fix_solution(self, suite: JudgeSuite) -> None:
         if not self.current_problem_markdown:
             self.notify("Problem is still loading.", severity="warning")
             return
@@ -485,10 +422,9 @@ class LetsCodeApp(App):
 
         try:
             judge = await self._ensure_judge()
-            path = self._solution_path(judge)
-            if not path.exists():
-                self._write_solution_file(path, judge.initial_code_snippet)
-            solution_code = path.read_text(encoding="utf-8")
+            path = solution_path(judge)
+            ensure_solution_file(path, judge.initial_code_snippet)
+            solution_code = read_solution_file(path)
         except Exception as error:
             await judge_output.update(f"# Judge\n\nUnable to prepare fix: `{error}`")
             self.notify(f"Unable to prepare fix: {error}", severity="error")
@@ -496,16 +432,15 @@ class LetsCodeApp(App):
 
         await judge_output.update(f"# Judge\n\nRunning {suite} tests before fixing...")
         try:
-            run = await self._run_solution_tests(suite, solution_code, judge)
-            judge_report = self._format_judge_run(suite, run)
-        except Exception as error:
-            judge_report = (
-                "# Judge\n\n"
-                f"{suite.title()} tests: error\n\n"
-                "```text\n"
-                f"{type(error).__name__}: {error}\n"
-                "```"
+            run = await asyncio.to_thread(
+                run_solution_suite,
+                suite,
+                solution_code,
+                judge,
             )
+            judge_report = format_judge_run(suite, run)
+        except Exception as error:
+            judge_report = format_judge_error(suite, error)
 
         await judge_output.update(f"{judge_report}\n\nGenerating fix...")
 
@@ -531,7 +466,7 @@ class LetsCodeApp(App):
             return
 
         try:
-            self._write_solution_file(path, fixed_code)
+            write_solution_file(path, fixed_code)
         except OSError as error:
             await judge_output.update(
                 f"# Judge\n\nUnable to write fixed solution: `{error}`"
@@ -545,7 +480,12 @@ class LetsCodeApp(App):
         )
 
         try:
-            fixed_run = await self._run_solution_tests(suite, fixed_code, judge)
+            fixed_run = await asyncio.to_thread(
+                run_solution_suite,
+                suite,
+                fixed_code,
+                judge,
+            )
         except Exception as error:
             await judge_output.update(
                 "# Judge\n\nFixed solution was written, but tests errored:\n\n"
@@ -556,7 +496,7 @@ class LetsCodeApp(App):
             self.notify("Fix written, but tests errored.", severity="warning")
             return
 
-        await judge_output.update(self._format_judge_run(suite, fixed_run))
+        await judge_output.update(format_judge_run(suite, fixed_run))
         if fixed_run.passed:
             self.notify("Solution fixed.")
         else:
@@ -572,10 +512,9 @@ class LetsCodeApp(App):
 
         try:
             judge = await self._ensure_judge()
-            path = self._solution_path(judge)
-            if not path.exists():
-                self._write_solution_file(path, judge.initial_code_snippet)
-            editor = self._editor_command(path)
+            path = solution_path(judge)
+            ensure_solution_file(path, judge.initial_code_snippet)
+            editor = editor_command(path)
         except Exception as error:
             await judge_output.update(f"# Judge\n\nUnable to prepare editor: `{error}`")
             self.notify(f"Unable to prepare editor: {error}", severity="error")
@@ -601,7 +540,7 @@ class LetsCodeApp(App):
             return
 
         try:
-            solution_code = path.read_text(encoding="utf-8")
+            solution_code = read_solution_file(path)
         except OSError as error:
             await judge_output.update(
                 f"# Judge\n\nUnable to read edited code: `{error}`"
@@ -627,12 +566,11 @@ class LetsCodeApp(App):
             self.notify(f"Unable to generate judge: {error}", severity="error")
             return
 
-        path = self._solution_path(judge)
-        if not path.exists():
-            self._write_solution_file(path, judge.initial_code_snippet)
+        path = solution_path(judge)
+        ensure_solution_file(path, judge.initial_code_snippet)
 
         try:
-            solution_code = path.read_text(encoding="utf-8")
+            solution_code = read_solution_file(path)
         except OSError as error:
             await judge_output.update(f"# Judge\n\nUnable to read solution: `{error}`")
             self.notify(f"Unable to read solution: {error}", severity="error")
@@ -655,64 +593,16 @@ class LetsCodeApp(App):
 
         return self.current_judge
 
-    def _solution_path(self, judge: GeneratedJudge) -> Path:
-        return default_data_path() / "solutions" / f"{judge.problem_hash}.py"
-
-    def _write_solution_file(self, path: Path, solution_code: str) -> None:
-        path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(solution_code, encoding="utf-8")
-        self.current_solution_path = path
-
-    def _editor_command(self, path: Path) -> list[str]:
-        editor = os.getenv("EDITOR")
-        if not editor:
-            raise RuntimeError("Set $EDITOR before opening the code editor")
-
-        command = shlex.split(editor)
-        if not command:
-            raise RuntimeError("Set $EDITOR before opening the code editor")
-
-        return [*command, str(path)]
-
     async def _update_solution_preview(
         self,
         solution_code: str,
         path: Path | None = None,
     ) -> None:
-        self.current_solution_path = path
         label = f"`{path}`" if path is not None else "No solution file loaded."
         preview = solution_code.strip() or "# No solution loaded."
         await self.query_one(self.SOLUTION_PREVIEW_SELECTOR, Markdown).update(
             f"{label}\n\n```python\n{preview}\n```"
         )
-
-    async def _run_solution_tests(
-        self,
-        suite: str,
-        solution_code: str,
-        judge: GeneratedJudge,
-    ):
-        if suite == "testfire":
-            return await asyncio.to_thread(run_testfire, solution_code, judge)
-
-        return await asyncio.to_thread(run_full_suite, solution_code, judge)
-
-    def _format_judge_run(self, suite: str, run) -> str:
-        lines = [
-            "# Judge",
-            "",
-            f"{suite.title()} tests: {'passed' if run.passed else 'failed'}",
-        ]
-
-        for result in run.results:
-            state = "passed" if result.passed else "failed"
-            lines.extend(["", f"## {result.suite}: {state}"])
-            if result.message:
-                lines.extend(["", result.message])
-            if result.error:
-                lines.extend(["", "```text", result.error.strip(), "```"])
-
-        return "\n".join(lines)
 
     async def on_prompt_input_submitted(self, event: PromptInput.Submitted) -> None:
         """Handle user input."""
