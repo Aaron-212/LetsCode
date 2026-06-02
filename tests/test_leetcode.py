@@ -1,6 +1,7 @@
 import asyncio
 import json
 import unittest
+from unittest.mock import patch
 
 import httpx
 
@@ -27,6 +28,7 @@ class LeetCodeFetcherTest(unittest.TestCase):
                     json={
                         "data": {
                             "problemsetQuestionList": {
+                                "total": 1,
                                 "questions": [
                                     {
                                         "frontendQuestionId": "1",
@@ -118,6 +120,7 @@ class LeetCodeFetcherTest(unittest.TestCase):
                 json={
                     "data": {
                         "problemsetQuestionList": {
+                            "total": 10,
                             "questions": [
                                 {
                                     "frontendQuestionId": "2",
@@ -145,6 +148,78 @@ class LeetCodeFetcherTest(unittest.TestCase):
             problem.url,
             "https://leetcode.com/problems/add-two-numbers/",
         )
+
+    def test_get_random_problem_id_uses_random_offset(self) -> None:
+        requests: list[dict[str, object]] = []
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            payload = json.loads(request.content)
+            requests.append(payload)
+
+            skip = payload["variables"]["skip"]
+            question = {
+                "frontendQuestionId": "42",
+                "title": "Trapping Rain Water",
+                "titleSlug": "trapping-rain-water",
+                "difficulty": "Hard",
+                "paidOnly": False,
+                "hasSolution": True,
+            }
+            return httpx.Response(
+                200,
+                json={
+                    "data": {
+                        "problemsetQuestionList": {
+                            "total": 100,
+                            "questions": [question] if skip == 41 else [],
+                        }
+                    }
+                },
+            )
+
+        fetcher = LeetCodeFetcher(transport=httpx.MockTransport(handler))
+
+        with patch("letscode.leetcode.random.randrange", return_value=41):
+            question_id = asyncio.run(fetcher.get_random_problem_id())
+
+        self.assertEqual(question_id, 42)
+        self.assertEqual(
+            [request["variables"]["skip"] for request in requests],
+            [0, 41],
+        )
+
+    def test_get_random_problem_id_skips_paid_only_problem(self) -> None:
+        def handler(request: httpx.Request) -> httpx.Response:
+            payload = json.loads(request.content)
+            skip = payload["variables"]["skip"]
+            paid_only = skip == 3
+            return httpx.Response(
+                200,
+                json={
+                    "data": {
+                        "problemsetQuestionList": {
+                            "total": 100,
+                            "questions": [
+                                {
+                                    "frontendQuestionId": "50" if paid_only else "51",
+                                    "title": "Sample",
+                                    "titleSlug": "sample",
+                                    "difficulty": "Medium",
+                                    "paidOnly": paid_only,
+                                    "hasSolution": True,
+                                }
+                            ],
+                        }
+                    }
+                },
+            )
+
+        fetcher = LeetCodeFetcher(transport=httpx.MockTransport(handler))
+
+        with patch("letscode.leetcode.random.randrange", side_effect=[3, 4]):
+            question_id = asyncio.run(fetcher.get_random_problem_id())
+
+        self.assertEqual(question_id, 51)
 
 
 if __name__ == "__main__":

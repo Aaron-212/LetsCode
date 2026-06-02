@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import shutil
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
@@ -70,6 +71,9 @@ class ProblemStore:
             encoding="utf-8",
         )
         temp_path.replace(self.state_path)
+
+    def reset_all(self) -> None:
+        shutil.rmtree(self.data_path, ignore_errors=True)
 
     def load_problem(self, question_id: int) -> StoredProblem | None:
         path = self._problem_path(question_id)

@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import logging
+import random
+from dataclasses import dataclass
 from typing import Any
 
 import httpx
@@ -11,6 +13,12 @@ from .model.leetcode import LeetCodeQuestion, LeetCodeQuestionList
 
 
 logger = logging.getLogger(__name__)
+
+
+@dataclass(frozen=True)
+class ProblemsetQuestionPage:
+    total: int
+    questions: list[dict[str, Any]]
 
 
 class LeetCodeFetcher:
@@ -102,6 +110,34 @@ query problemsetQuestionList(
             [self._normalize_question_list_item(question) for question in questions]
         )
 
+    async def get_random_problem_id(self, max_attempts: int = 20) -> int | None:
+        page = await self._get_problemset_question_page(limit=1, skip=0)
+        if page is None or page.total < 1:
+            return None
+
+        for _ in range(max_attempts):
+            page = await self._get_problemset_question_page(
+                limit=1,
+                skip=random.randrange(page.total),
+            )
+            if page is None:
+                return None
+
+            if not page.questions:
+                continue
+
+            question = page.questions[0]
+            if bool(question.get("paidOnly")):
+                continue
+
+            question_id = self._normalize_question_id(
+                question.get("frontendQuestionId")
+            )
+            if question_id > 0:
+                return question_id
+
+        return None
+
     async def get_problem(self, question_slug: int | str) -> LeetCodeQuestion | None:
         title_slug = await self._resolve_title_slug(question_slug)
         if title_slug is None:
@@ -153,6 +189,20 @@ query problemsetQuestionList(
         skip: int,
         filters: dict[str, Any] | None = None,
     ) -> list[dict[str, Any]] | None:
+        page = await self._get_problemset_question_page(
+            limit=limit,
+            skip=skip,
+            filters=filters,
+        )
+        return page.questions if page is not None else None
+
+    async def _get_problemset_question_page(
+        self,
+        *,
+        limit: int,
+        skip: int,
+        filters: dict[str, Any] | None = None,
+    ) -> ProblemsetQuestionPage | None:
         variables = {
             "categorySlug": "",
             "limit": limit,
@@ -175,10 +225,14 @@ query problemsetQuestionList(
         questions = (
             problemset.get("questions") if isinstance(problemset, dict) else None
         )
-        if not isinstance(questions, list):
+        total = problemset.get("total") if isinstance(problemset, dict) else None
+        if not isinstance(questions, list) or not isinstance(total, int):
             return None
 
-        return [question for question in questions if isinstance(question, dict)]
+        return ProblemsetQuestionPage(
+            total=total,
+            questions=[question for question in questions if isinstance(question, dict)],
+        )
 
     async def _graphql(
         self,

@@ -1,6 +1,8 @@
+import argparse
 import asyncio
 import os
 import subprocess
+from collections.abc import Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Literal
@@ -35,6 +37,7 @@ from .judge import (
     is_judge_suite,
     run_solution_suite,
 )
+from .leetcode import LeetCodeFetcher
 from .problem import (
     ProblemMarkdown,
     generate_custom_problem_markdown,
@@ -64,6 +67,30 @@ def parse_question_id(value: str) -> int | None:
         return int(value)
     except ValueError:
         return None
+
+
+def parse_cli_question_id(value: str) -> int:
+    question_id = parse_question_id(value)
+    if question_id is None:
+        raise argparse.ArgumentTypeError("must be an integer question id")
+
+    return question_id
+
+
+def parse_cli_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(prog="letscode")
+    parser.add_argument(
+        "--reset",
+        action="store_true",
+        help="Reset saved state, cached problems, judges, and solutions, then quit.",
+    )
+    parser.add_argument(
+        "--problem",
+        type=parse_cli_question_id,
+        metavar="ID",
+        help="Load the given problem on launch instead of the last session.",
+    )
+    return parser.parse_args(argv)
 
 
 class ChatBubble(Horizontal):
@@ -236,6 +263,15 @@ class LetsCodeApp(App):
     HINT_COMMAND = "/hint"
     FIX_COMMAND = "/fix"
     RESET_COMMAND = "/reset"
+    RANDOM_COMMAND = "/random"
+    SLASH_COMMANDS = (
+        LOAD_PROBLEM_COMMAND,
+        NEW_COMMAND,
+        HINT_COMMAND,
+        FIX_COMMAND,
+        RESET_COMMAND,
+        RANDOM_COMMAND,
+    )
 
     CSS = """\
     Screen {
@@ -341,6 +377,10 @@ class LetsCodeApp(App):
     }
     """
 
+    def __init__(self, initial_problem_id: int | None = None) -> None:
+        super().__init__()
+        self.initial_problem_id = initial_problem_id
+
     def compose(self) -> ComposeResult:
         yield Header()
         with TabbedContent():
@@ -390,8 +430,11 @@ class LetsCodeApp(App):
     def on_mount(self) -> None:
         self.query_one(self.INPUT_SELECTOR, PromptInput).focus()
         self.problem_store = ProblemStore()
+        last_question_id = self.problem_store.load_last_question_id()
         self.current_problem_id = (
-            self.problem_store.load_last_question_id() or self.DEFAULT_PROBLEM_ID
+            self.initial_problem_id
+            if self.initial_problem_id is not None
+            else last_question_id or self.DEFAULT_PROBLEM_ID
         )
         self.current_problem_markdown = ""
         self.current_fetched_hints_markdown: list[str] = []
@@ -406,7 +449,12 @@ class LetsCodeApp(App):
         self.run_worker(self.load_problem(self.current_problem_id), exclusive=True)
 
     def handle_slash_command(self, message: str) -> bool:
-        command, _, arg_text = message.partition(" ")
+        parts = message.split(maxsplit=1)
+        if not parts:
+            return False
+
+        command = parts[0]
+        arg_text = parts[1] if len(parts) == 2 else ""
         args = arg_text.split()
 
         if command == self.LOAD_PROBLEM_COMMAND:
@@ -424,7 +472,15 @@ class LetsCodeApp(App):
         if command == self.RESET_COMMAND:
             return self._handle_reset_command(args)
 
-        return False
+        if command == self.RANDOM_COMMAND:
+            return self._handle_random_command(args)
+
+        available_commands = ", ".join(self.SLASH_COMMANDS)
+        self.notify(
+            f"Unknown command: {command}. Available commands: {available_commands}",
+            severity="warning",
+        )
+        return True
 
     def _handle_load_problem_command(self, args: list[str]) -> bool:
         if not args:
@@ -475,12 +531,29 @@ class LetsCodeApp(App):
         self.run_worker(self.reset_solution(question_id), exclusive=True)
         return True
 
+    def _handle_random_command(self, args: list[str]) -> bool:
+        if args:
+            self.notify("Usage: /random", severity="warning")
+            return True
+
+        self.run_worker(self.load_random_problem(), exclusive=True)
+        return True
+
     async def load_problem(self, question_id: int) -> None:
         problem_markdown = await load_problem_markdown(
             question_id,
             store=self.problem_store,
         )
         await self.activate_problem(question_id, problem_markdown)
+
+    async def load_random_problem(self) -> None:
+        self.notify("Loading a random problem...")
+        question_id = await LeetCodeFetcher().get_random_problem_id()
+        if question_id is None:
+            self.notify("Unable to find a random problem.", severity="error")
+            return
+
+        await self.load_problem(question_id)
 
     async def create_problem(self, prompt: str) -> None:
         self.notify("Generating new problem...")
@@ -1034,9 +1107,14 @@ class LetsCodeApp(App):
         self.run_worker(self.chat_with_agent(message), exclusive=True)
 
 
-def main() -> None:
+def main(argv: Sequence[str] | None = None) -> None:
     load_dotenv()
-    app = LetsCodeApp()
+    args = parse_cli_args(argv)
+    if args.reset:
+        ProblemStore().reset_all()
+        return
+
+    app = LetsCodeApp(initial_problem_id=args.problem)
     app.run()
 
 
