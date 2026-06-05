@@ -6,7 +6,8 @@ from typing import Any, Sequence, cast
 from deepagents import create_deep_agent
 from langchain_core.messages import AIMessage, BaseMessage, HumanMessage
 from langchain_core.tools import BaseTool, tool
-from langchain_openai import ChatOpenAI
+
+from .ai_http import OpenAIHttpClients, create_chat_model
 
 
 @dataclass
@@ -42,8 +43,13 @@ class LetsCodeAgent:
     for the full solution file.
     """
 
-    def __init__(self, model_slug: str) -> None:
-        model = ChatOpenAI(model=model_slug)
+    def __init__(
+        self,
+        model_slug: str,
+        *,
+        http_clients: OpenAIHttpClients | None = None,
+    ) -> None:
+        model = create_chat_model(model_slug, http_clients=http_clients)
         self.state = LetsCodeAgentState()
 
         self.agent = create_deep_agent(

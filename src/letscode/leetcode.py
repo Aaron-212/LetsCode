@@ -11,7 +11,6 @@ from pydantic import ValidationError
 from .constants import USER_AGENT
 from .model.leetcode import LeetCodeQuestion, LeetCodeQuestionList
 
-
 logger = logging.getLogger(__name__)
 
 
@@ -231,7 +230,9 @@ query problemsetQuestionList(
 
         return ProblemsetQuestionPage(
             total=total,
-            questions=[question for question in questions if isinstance(question, dict)],
+            questions=[
+                question for question in questions if isinstance(question, dict)
+            ],
         )
 
     async def _graphql(

@@ -59,6 +59,41 @@ class JudgeHelpersTest(unittest.TestCase):
         self.assertIn("Testfire tests: error", rendered)
         self.assertIn("RuntimeError: bad test", rendered)
 
+    def test_run_solution_suite_reports_assertion_context(self) -> None:
+        judge = GeneratedJudge(
+            problem_hash="abc123",
+            initial_code_snippet="class Solution:\n    pass\n",
+            testfire_code="def testfire(Solution):\n    pass\n",
+            full_test_code=(
+                "def full_test_suite(Solution):\n"
+                "    actual = Solution().add(1, 2)\n"
+                "    expected = 4\n"
+                "    assert actual == expected\n"
+            ),
+            model_slug="test-model",
+        )
+        solution_code = (
+            "class Solution:\n"
+            "    def add(self, left, right):\n"
+            "        return left + right\n"
+        )
+
+        run = run_solution_suite("full", solution_code, judge)
+
+        self.assertFalse(run.passed)
+        [result] = run.results
+        self.assertIn(
+            "Assertion failed in full_test_suite at line 4: "
+            "assert actual == expected",
+            result.message,
+        )
+        self.assertIsNotNone(result.error)
+        assert result.error is not None
+        self.assertIn("Location: <generated_full_tests>:4", result.error)
+        self.assertIn("Failing assertion:\n  assert actual == expected", result.error)
+        self.assertIn("actual = 3", result.error)
+        self.assertIn("expected = 4", result.error)
+
     def test_is_judge_suite_validates_known_suites(self) -> None:
         self.assertTrue(is_judge_suite("testfire"))
         self.assertTrue(is_judge_suite("full"))

@@ -2,18 +2,21 @@ from __future__ import annotations
 
 import hashlib
 import json
+import linecache
+import reprlib
+import sys
+import traceback
 from dataclasses import asdict, dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
-from types import ModuleType
+from types import FrameType, ModuleType, TracebackType
 from typing import Any, Literal, TypeGuard
 
 from langchain_core.messages import HumanMessage, SystemMessage
-from langchain_openai import ChatOpenAI
 from platformdirs import PlatformDirs
 
+from .ai_http import OpenAIHttpClients, create_chat_model
 from .agent import format_message_content
-
 
 JudgeSuite = Literal["testfire", "full"]
 DEFAULT_JUDGE_SUITE: JudgeSuite = "testfire"
@@ -52,7 +55,7 @@ Return only strict JSON with these string fields:
 - full_test_code
 
 initial_code_snippet must define class Solution with the method signature that
-matches the problem.
+matches the problem, with proper type annotations.
 
 testfire_code must define exactly this function:
 def testfire(Solution): ...
@@ -64,7 +67,10 @@ Both test functions receive the candidate Solution class, instantiate it as
 needed, and use plain assert statements. testfire must cover only examples from
 the problem statement. full_test_suite must include those examples plus broader
 edge cases derived from the constraints. Do not use pytest, unittest, file I/O,
-network access, randomness, sleeps, subprocesses, or shell commands.
+network access, sleeps, subprocesses, or shell commands.
+Using random library is allowed.
+
+READ AND COMPREHEND THE PROBLEM THOROUGHLY TO AVOID WRITING WRONG TESTS.
 """
 
 
@@ -77,13 +83,14 @@ def generate_judge(
     model_slug: str = "openai:gpt-5.4-mini",
     data_path: Path | None = None,
     overwrite: bool = False,
+    http_clients: OpenAIHttpClients | None = None,
 ) -> GeneratedJudge:
     problem_hash = hash_problem(problem)
     existing = load_generated_judge(problem_hash, data_path)
     if existing is not None and not overwrite:
         return existing
 
-    model = ChatOpenAI(model=model_slug)
+    model = create_chat_model(model_slug, http_clients=http_clients)
     response = model.invoke(
         [
             SystemMessage(content=JUDGE_SYSTEM_PROMPT),
@@ -256,7 +263,10 @@ def _parse_generated_payload(content: str) -> dict[str, Any]:
 
 def _load_code(code: str, module_name: str) -> ModuleType:
     namespace = ModuleType(module_name)
-    exec(code, namespace.__dict__)
+    filename = f"<{module_name}>"
+    lines = [line if line.endswith("\n") else f"{line}\n" for line in code.splitlines()]
+    linecache.cache[filename] = (len(code), None, lines, filename)
+    exec(compile(code, filename, "exec"), namespace.__dict__)
     return namespace
 
 
@@ -267,14 +277,21 @@ def _run_generated_test(
     solution_class: type,
 ) -> TestResult:
     try:
-        test_namespace = _load_code(test_code, f"generated_{suite}_tests")
+        test_module_name = f"generated_{suite}_tests"
+        test_namespace = _load_code(test_code, test_module_name)
         test_function = getattr(test_namespace, function_name)
         test_function(solution_class)
     except AssertionError as error:
+        message, details = _format_assertion_failure(
+            error,
+            module_name=test_module_name,
+            function_name=function_name,
+        )
         return TestResult(
             suite=suite,
             passed=False,
-            message=str(error) or "Assertion failed.",
+            message=message,
+            error=details,
         )
     except Exception:
         return TestResult(
@@ -287,8 +304,85 @@ def _run_generated_test(
 
 
 def _format_current_error() -> str:
-    error_type, error, _traceback = __import__("sys").exc_info()
+    error_type, error, _traceback = sys.exc_info()
     if error_type is None or error is None:
         return "Unknown test failure."
 
     return f"{error_type.__name__}: {error}"
+
+
+def _format_assertion_failure(
+    error: AssertionError,
+    module_name: str,
+    function_name: str,
+) -> tuple[str, str]:
+    frame = _find_traceback_frame(error.__traceback__, f"<{module_name}>")
+    assertion_message = str(error).strip()
+    if frame is None:
+        message = assertion_message or "Assertion failed."
+        details = "".join(traceback.format_exception_only(type(error), error)).strip()
+        return message, details
+
+    filename = frame.f_code.co_filename
+    line_number = frame.f_lineno
+    source_line = linecache.getline(filename, line_number).strip()
+    if source_line:
+        message = (
+            f"Assertion failed in {function_name} at line {line_number}: {source_line}"
+        )
+    else:
+        message = f"Assertion failed in {function_name} at line {line_number}."
+
+    details = [
+        f"Location: {filename}:{line_number}",
+    ]
+    if assertion_message:
+        details.append(f"Assertion message: {assertion_message}")
+    if source_line:
+        details.extend(["Failing assertion:", f"  {source_line}"])
+
+    local_values = _format_frame_locals(frame)
+    if local_values:
+        details.extend(["Locals:", *local_values])
+
+    return message, "\n".join(details)
+
+
+def _find_traceback_frame(
+    current_traceback: TracebackType | None,
+    filename: str,
+) -> FrameType | None:
+    frame: FrameType | None = None
+    while current_traceback is not None:
+        if current_traceback.tb_frame.f_code.co_filename == filename:
+            frame = current_traceback.tb_frame
+        current_traceback = current_traceback.tb_next
+
+    return frame
+
+
+def _format_frame_locals(frame: FrameType) -> list[str]:
+    formatter = reprlib.Repr()
+    formatter.maxdict = 8
+    formatter.maxlist = 12
+    formatter.maxtuple = 12
+    formatter.maxset = 12
+    formatter.maxstring = 200
+    formatter.maxother = 200
+
+    lines: list[str] = []
+    for name, value in frame.f_locals.items():
+        if len(lines) >= 12:
+            lines.append("  ...")
+            break
+        if name.startswith("__") or name == "Solution":
+            continue
+        if isinstance(value, ModuleType | type) or callable(value):
+            continue
+
+        rendered = formatter.repr(value)
+        if rendered.startswith("<") and rendered.endswith(">"):
+            continue
+        lines.append(f"  {name} = {rendered}")
+
+    return lines

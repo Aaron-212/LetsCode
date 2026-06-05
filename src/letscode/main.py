@@ -25,6 +25,7 @@ from textual.widgets import (
     TextArea,
 )
 
+from .ai_http import OpenAIHttpClients
 from .agent import LetsCodeAgent
 from .judge import (
     DEFAULT_JUDGE_SUITE,
@@ -90,7 +91,25 @@ def parse_cli_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         metavar="ID",
         help="Load the given problem on launch instead of the last session.",
     )
-    return parser.parse_args(argv)
+    parser.add_argument(
+        "--no-leetcode",
+        action="store_true",
+        help="Start without loading a LeetCode problem.",
+    )
+    parser.add_argument(
+        "--new",
+        metavar="PROMPT",
+        help="Generate a new AI-created problem from the given prompt on launch.",
+    )
+    args = parser.parse_args(argv)
+
+    if args.problem is not None and args.no_leetcode:
+        parser.error("--problem cannot be used with --no-leetcode")
+
+    if args.problem is not None and args.new is not None:
+        parser.error("--problem cannot be used with --new")
+
+    return args
 
 
 class ChatBubble(Horizontal):
@@ -377,9 +396,18 @@ class LetsCodeApp(App):
     }
     """
 
-    def __init__(self, initial_problem_id: int | None = None) -> None:
+    def __init__(
+        self,
+        initial_problem_id: int | None = None,
+        *,
+        initial_new_prompt: str | None = None,
+        load_initial_problem: bool = True,
+    ) -> None:
         super().__init__()
         self.initial_problem_id = initial_problem_id
+        self.initial_new_prompt = initial_new_prompt
+        self.load_initial_problem = load_initial_problem
+        self.openai_http_clients = OpenAIHttpClients()
 
     def compose(self) -> ComposeResult:
         yield Header()
@@ -443,10 +471,32 @@ class LetsCodeApp(App):
         self.chat_entries: list[ChatEntry] = []
         self.agent: LetsCodeAgent | None = None
         self.current_judge: GeneratedJudge | None = None
-        self.action_load_problem()
+        if self.initial_new_prompt is not None:
+            self.run_worker(self.create_problem(self.initial_new_prompt), exclusive=True)
+        elif self.load_initial_problem:
+            self.action_load_problem()
+        else:
+            self.run_worker(self.show_no_problem(), exclusive=True)
 
     def action_load_problem(self) -> None:
         self.run_worker(self.load_problem(self.current_problem_id), exclusive=True)
+
+    async def show_no_problem(self) -> None:
+        await self.query_one(self.PROBLEM_SELECTOR, Markdown).update(
+            "# No Problem Loaded\n\nUse `/problem [question_id]`, `/random`, "
+            "or `/new [prompt]` to start."
+        )
+        await self._update_solution_preview("")
+        await self.query_one(self.JUDGE_SELECTOR, JudgeOutput).update_status(
+            "No problem loaded."
+        )
+        await self._render_hints([], [])
+        await self._render_chat_log()
+
+    def action_quit(self) -> None:
+        self.workers.cancel_all()
+        self.openai_http_clients.close()
+        self.exit()
 
     def handle_slash_command(self, message: str) -> bool:
         parts = message.split(maxsplit=1)
@@ -571,6 +621,7 @@ class LetsCodeApp(App):
                 generate_custom_problem_markdown,
                 prompt,
                 model_slug,
+                http_clients=self.openai_http_clients,
             )
         except Exception as error:
             await self.query_one(self.JUDGE_SELECTOR, JudgeOutput).update_error(
@@ -734,7 +785,10 @@ class LetsCodeApp(App):
     def get_agent(self) -> LetsCodeAgent:
         if self.agent is None:
             model_slug = os.getenv("LETSCODE_AGENT_MODEL", self.DEFAULT_AGENT_MODEL)
-            self.agent = LetsCodeAgent(model_slug)
+            self.agent = LetsCodeAgent(
+                model_slug,
+                http_clients=self.openai_http_clients,
+            )
             self.agent.set_problem_context(
                 question_id=self.current_problem_id,
                 problem_markdown=self.current_problem_markdown,
@@ -924,6 +978,7 @@ class LetsCodeApp(App):
                     generate_judge,
                     problem_markdown.problem,
                     model_slug,
+                    http_clients=self.openai_http_clients,
                 )
 
             path = solution_path(judge)
@@ -1029,6 +1084,7 @@ class LetsCodeApp(App):
                 generate_judge,
                 self.current_problem_markdown,
                 model_slug,
+                http_clients=self.openai_http_clients,
             )
 
         return self.current_judge
@@ -1114,7 +1170,11 @@ def main(argv: Sequence[str] | None = None) -> None:
         ProblemStore().reset_all()
         return
 
-    app = LetsCodeApp(initial_problem_id=args.problem)
+    app = LetsCodeApp(
+        initial_problem_id=args.problem,
+        initial_new_prompt=args.new,
+        load_initial_problem=not args.no_leetcode and args.new is None,
+    )
     app.run()
 
 

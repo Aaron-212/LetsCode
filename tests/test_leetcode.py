@@ -38,7 +38,7 @@ class LeetCodeFetcherTest(unittest.TestCase):
                                         "paidOnly": False,
                                         "hasSolution": True,
                                     }
-                                ]
+                                ],
                             }
                         }
                     },
@@ -130,7 +130,7 @@ class LeetCodeFetcherTest(unittest.TestCase):
                                     "paidOnly": False,
                                     "hasSolution": True,
                                 }
-                            ]
+                            ],
                         }
                     }
                 },

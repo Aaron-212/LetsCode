@@ -4,8 +4,8 @@ from dataclasses import dataclass
 from typing import Any
 
 from langchain_core.messages import HumanMessage, SystemMessage
-from langchain_openai import ChatOpenAI
 
+from .ai_http import OpenAIHttpClients, create_chat_model
 from .leetcode import LeetCodeFetcher
 from .markdown import html_to_markdown
 from .model.leetcode import LeetCodeQuestion
@@ -89,12 +89,17 @@ def generate_custom_problem_markdown(
     model_slug: str = "openai:gpt-5.4-mini",
     *,
     model: Any | None = None,
+    http_clients: OpenAIHttpClients | None = None,
 ) -> str:
     prompt = prompt.strip()
     if not prompt:
         raise ValueError("custom problem prompt cannot be empty")
 
-    chat_model = model or ChatOpenAI(model=model_slug)
+    chat_model = create_chat_model(
+        model_slug,
+        http_clients=http_clients,
+        model=model,
+    )
     response = chat_model.invoke(
         [
             SystemMessage(content=CUSTOM_PROBLEM_SYSTEM_PROMPT),

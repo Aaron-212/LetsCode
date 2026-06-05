@@ -2,7 +2,7 @@ import inspect
 import io
 import unittest
 from contextlib import redirect_stderr
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 from rich.syntax import Syntax
 from textual.app import App, ComposeResult
@@ -107,6 +107,8 @@ class CliArgsTest(unittest.TestCase):
         args = parse_cli_args(["--problem", "42"])
 
         self.assertEqual(args.problem, 42)
+        self.assertIsNone(args.new)
+        self.assertFalse(args.no_leetcode)
         self.assertFalse(args.reset)
 
     def test_parse_cli_args_accepts_custom_negative_problem_id(self) -> None:
@@ -114,10 +116,33 @@ class CliArgsTest(unittest.TestCase):
 
         self.assertEqual(args.problem, -1)
 
+    def test_parse_cli_args_accepts_no_leetcode(self) -> None:
+        args = parse_cli_args(["--no-leetcode"])
+
+        self.assertTrue(args.no_leetcode)
+        self.assertIsNone(args.problem)
+        self.assertIsNone(args.new)
+
+    def test_parse_cli_args_accepts_new_prompt(self) -> None:
+        args = parse_cli_args(["--new", "dynamic programming with strings"])
+
+        self.assertEqual(args.new, "dynamic programming with strings")
+        self.assertIsNone(args.problem)
+
     def test_parse_cli_args_rejects_non_integer_problem_id(self) -> None:
         with redirect_stderr(io.StringIO()):
             with self.assertRaises(SystemExit):
                 parse_cli_args(["--problem", "two-sum"])
+
+    def test_parse_cli_args_rejects_problem_with_no_leetcode(self) -> None:
+        with redirect_stderr(io.StringIO()):
+            with self.assertRaises(SystemExit):
+                parse_cli_args(["--problem", "42", "--no-leetcode"])
+
+    def test_parse_cli_args_rejects_problem_with_new_prompt(self) -> None:
+        with redirect_stderr(io.StringIO()):
+            with self.assertRaises(SystemExit):
+                parse_cli_args(["--problem", "42", "--new", "graphs"])
 
 
 class MainCliTest(unittest.TestCase):
@@ -135,8 +160,48 @@ class MainCliTest(unittest.TestCase):
         with patch("letscode.main.LetsCodeApp") as app_class:
             main(["--problem", "42"])
 
-        app_class.assert_called_once_with(initial_problem_id=42)
+        app_class.assert_called_once_with(
+            initial_problem_id=42,
+            initial_new_prompt=None,
+            load_initial_problem=True,
+        )
         app_class.return_value.run.assert_called_once_with()
+
+    def test_main_no_leetcode_starts_app_without_initial_problem_load(self) -> None:
+        with patch("letscode.main.LetsCodeApp") as app_class:
+            main(["--no-leetcode"])
+
+        app_class.assert_called_once_with(
+            initial_problem_id=None,
+            initial_new_prompt=None,
+            load_initial_problem=False,
+        )
+        app_class.return_value.run.assert_called_once_with()
+
+    def test_main_new_starts_app_with_initial_new_prompt(self) -> None:
+        with patch("letscode.main.LetsCodeApp") as app_class:
+            main(["--new", "arrays and heaps"])
+
+        app_class.assert_called_once_with(
+            initial_problem_id=None,
+            initial_new_prompt="arrays and heaps",
+            load_initial_problem=False,
+        )
+        app_class.return_value.run.assert_called_once_with()
+
+
+class QuitActionTest(unittest.TestCase):
+    def test_quit_cancels_workers_and_closes_openai_connections(self) -> None:
+        app = LetsCodeApp()
+        app.workers.cancel_all = Mock()  # type: ignore[method-assign]
+        app.openai_http_clients.close = Mock()  # type: ignore[method-assign]
+        app.exit = Mock()  # type: ignore[method-assign]
+
+        app.action_quit()
+
+        app.workers.cancel_all.assert_called_once_with()
+        app.openai_http_clients.close.assert_called_once_with()
+        app.exit.assert_called_once_with()
 
 
 class SlashCommandTest(unittest.TestCase):
