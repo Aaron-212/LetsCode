@@ -281,6 +281,8 @@ class LetsCodeApp(App):
     NEW_COMMAND = "/new"
     HINT_COMMAND = "/hint"
     FIX_COMMAND = "/fix"
+    SOLVE_COMMAND = "/solve"
+    CLEAR_COMMAND = "/clear"
     RESET_COMMAND = "/reset"
     RANDOM_COMMAND = "/random"
     SLASH_COMMANDS = (
@@ -288,6 +290,8 @@ class LetsCodeApp(App):
         NEW_COMMAND,
         HINT_COMMAND,
         FIX_COMMAND,
+        SOLVE_COMMAND,
+        CLEAR_COMMAND,
         RESET_COMMAND,
         RANDOM_COMMAND,
     )
@@ -471,6 +475,9 @@ class LetsCodeApp(App):
         self.chat_entries: list[ChatEntry] = []
         self.agent: LetsCodeAgent | None = None
         self.current_judge: GeneratedJudge | None = None
+        self.current_solution_code = ""
+        self.current_solution_path: Path | None = None
+        self.last_judge_output = ""
         if self.initial_new_prompt is not None:
             self.run_worker(self.create_problem(self.initial_new_prompt), exclusive=True)
         elif self.load_initial_problem:
@@ -518,6 +525,12 @@ class LetsCodeApp(App):
 
         if command == self.FIX_COMMAND:
             return self._handle_fix_command(args)
+
+        if command == self.SOLVE_COMMAND:
+            return self._handle_solve_command(args)
+
+        if command == self.CLEAR_COMMAND:
+            return self._handle_clear_command(args)
 
         if command == self.RESET_COMMAND:
             return self._handle_reset_command(args)
@@ -570,6 +583,22 @@ class LetsCodeApp(App):
             return True
 
         self.run_worker(self.fix_solution(suite), exclusive=True)
+        return True
+
+    def _handle_solve_command(self, args: list[str]) -> bool:
+        if args:
+            self.notify("Usage: /solve", severity="warning")
+            return True
+
+        self.run_worker(self.solve_problem(), exclusive=True)
+        return True
+
+    def _handle_clear_command(self, args: list[str]) -> bool:
+        if args:
+            self.notify("Usage: /clear", severity="warning")
+            return True
+
+        self.run_worker(self.clear_chat_history(), exclusive=True)
         return True
 
     def _handle_reset_command(self, args: list[str]) -> bool:
@@ -662,6 +691,9 @@ class LetsCodeApp(App):
         self.agent = None
         self.current_judge = None
         self.chat_entries = []
+        self.current_solution_code = ""
+        self.current_solution_path = None
+        self.last_judge_output = ""
 
         try:
             self.problem_store.save_last_question_id(question_id)
@@ -782,6 +814,36 @@ class LetsCodeApp(App):
             )
         )
 
+    def _set_current_solution_context(
+        self,
+        solution_code: str,
+        path: Path | None = None,
+        *,
+        judge_output: str | None = None,
+    ) -> None:
+        self.current_solution_code = solution_code
+        if path is not None:
+            self.current_solution_path = path
+        if judge_output is not None:
+            self.last_judge_output = judge_output
+
+        if self.agent is not None:
+            self.agent.set_solution_context(
+                solution_code=self.current_solution_code,
+                judge_output=self.last_judge_output,
+            )
+
+    async def refresh_solution_context(self) -> None:
+        if not self.current_problem_markdown:
+            return
+
+        judge = await self._ensure_judge()
+        path = solution_path(judge)
+        ensure_solution_file(path, judge.initial_code_snippet)
+        solution_code = read_solution_file(path)
+        self._set_current_solution_context(solution_code, path)
+        await self._update_solution_preview(solution_code, path)
+
     def get_agent(self) -> LetsCodeAgent:
         if self.agent is None:
             model_slug = os.getenv("LETSCODE_AGENT_MODEL", self.DEFAULT_AGENT_MODEL)
@@ -794,6 +856,10 @@ class LetsCodeApp(App):
                 problem_markdown=self.current_problem_markdown,
                 fetched_hints=self.current_fetched_hints_markdown,
                 generated_hints=self.current_generated_hints_markdown,
+            )
+            self.agent.set_solution_context(
+                solution_code=self.current_solution_code,
+                judge_output=self.last_judge_output,
             )
 
         return self.agent
@@ -862,8 +928,98 @@ class LetsCodeApp(App):
             self.notify(f"Unable to run tests: {error}", severity="error")
             return
 
+        judge_report = format_judge_run(suite, run)
+        self._set_current_solution_context(
+            solution_code,
+            path,
+            judge_output=judge_report,
+        )
         await judge_output.update_run(suite, run)
         await self._update_solution_preview(solution_code, path)
+
+    async def solve_problem(self) -> None:
+        if not self.current_problem_markdown:
+            self.notify("Problem is still loading.", severity="warning")
+            return
+
+        judge_output = self.query_one(self.JUDGE_SELECTOR, JudgeOutput)
+        await judge_output.update_status("Preparing to solve...")
+
+        try:
+            judge = await self._ensure_judge()
+            path = solution_path(judge)
+            ensure_solution_file(path, judge.initial_code_snippet)
+            solution_code = read_solution_file(path)
+        except Exception as error:
+            await judge_output.update_error(f"Unable to prepare solve: {error}")
+            self.notify(f"Unable to prepare solve: {error}", severity="error")
+            return
+
+        self._set_current_solution_context(solution_code, path, judge_output="")
+        await judge_output.update_status("Generating solution...")
+
+        try:
+            solved_code = await asyncio.to_thread(self.get_agent().solve_problem)
+        except Exception as error:
+            await judge_output.update_error(f"Unable to generate solution: {error}")
+            self.notify(f"Unable to generate solution: {error}", severity="error")
+            return
+
+        if "class Solution" not in solved_code:
+            await judge_output.update_error(
+                "Generated solution did not include a Solution class."
+            )
+            self.notify(
+                "Generated solution did not include a Solution class.",
+                severity="error",
+            )
+            return
+
+        try:
+            write_solution_file(path, solved_code)
+        except OSError as error:
+            await judge_output.update_error(f"Unable to write solution: {error}")
+            self.notify(f"Unable to write solution: {error}", severity="error")
+            return
+
+        self._set_current_solution_context(solved_code, path, judge_output="")
+        await self._update_solution_preview(solved_code, path)
+        await judge_output.update_status(
+            f"Solution written to {path}. Running {DEFAULT_JUDGE_SUITE} tests..."
+        )
+
+        try:
+            run = await asyncio.to_thread(
+                run_solution_suite,
+                DEFAULT_JUDGE_SUITE,
+                solved_code,
+                judge,
+            )
+        except Exception as error:
+            judge_report = format_judge_error(DEFAULT_JUDGE_SUITE, error)
+            self._set_current_solution_context(
+                solved_code,
+                path,
+                judge_output=judge_report,
+            )
+            await judge_output.update_error(
+                "Solution was written, but tests errored:\n\n"
+                f"{type(error).__name__}: {error}"
+            )
+            self.notify("Solution written, but tests errored.", severity="warning")
+            return
+
+        judge_report = format_judge_run(DEFAULT_JUDGE_SUITE, run)
+        self._set_current_solution_context(
+            solved_code,
+            path,
+            judge_output=judge_report,
+        )
+        await judge_output.update_run(DEFAULT_JUDGE_SUITE, run)
+        if run.passed:
+            self.notify("Solution generated.")
+        else:
+            self.notify("Solution written, but tests failed.", severity="warning")
 
     async def fix_solution(self, suite: JudgeSuite) -> None:
         if not self.current_problem_markdown:
@@ -899,8 +1055,9 @@ class LetsCodeApp(App):
 
         try:
             agent = self.get_agent()
-            agent.set_solution_context(
-                solution_code=solution_code,
+            self._set_current_solution_context(
+                solution_code,
+                path,
                 judge_output=judge_report,
             )
             fixed_code = await asyncio.to_thread(agent.fix_solution, suite)
@@ -925,6 +1082,7 @@ class LetsCodeApp(App):
             self.notify(f"Unable to write fixed solution: {error}", severity="error")
             return
 
+        self._set_current_solution_context(fixed_code, path, judge_output="")
         await self._update_solution_preview(fixed_code, path)
         await judge_output.update_status(
             f"Fixed solution written to {path}. Re-running {suite} tests..."
@@ -942,9 +1100,21 @@ class LetsCodeApp(App):
                 "Fixed solution was written, but tests errored:\n\n"
                 f"{type(error).__name__}: {error}"
             )
+            judge_report = format_judge_error(suite, error)
+            self._set_current_solution_context(
+                fixed_code,
+                path,
+                judge_output=judge_report,
+            )
             self.notify("Fix written, but tests errored.", severity="warning")
             return
 
+        judge_report = format_judge_run(suite, fixed_run)
+        self._set_current_solution_context(
+            fixed_code,
+            path,
+            judge_output=judge_report,
+        )
         await judge_output.update_run(suite, fixed_run)
         if fixed_run.passed:
             self.notify("Solution fixed.")
@@ -990,11 +1160,11 @@ class LetsCodeApp(App):
 
         if is_current_problem:
             await self._update_solution_preview(judge.initial_code_snippet, path)
-            if self.agent is not None:
-                self.agent.set_solution_context(
-                    solution_code=judge.initial_code_snippet,
-                    judge_output="",
-                )
+            self._set_current_solution_context(
+                judge.initial_code_snippet,
+                path,
+                judge_output="",
+            )
 
         await judge_output.update_status(
             f"Reset solution for problem {target_question_id} at {path}."
@@ -1043,6 +1213,7 @@ class LetsCodeApp(App):
             self.notify(f"Unable to read edited code: {error}", severity="error")
             return
 
+        self._set_current_solution_context(solution_code, path, judge_output="")
         await self._update_solution_preview(solution_code, path)
         await judge_output.update_status(
             f"Loaded edited solution from {path}. Run Testfire or Full."
@@ -1071,6 +1242,7 @@ class LetsCodeApp(App):
             self.notify(f"Unable to read solution: {error}", severity="error")
             return
 
+        self._set_current_solution_context(solution_code, path, judge_output="")
         await self._update_solution_preview(solution_code, path)
         await judge_output.update_status(
             "Judge ready. Use Edit to change the external solution file, "
@@ -1103,6 +1275,11 @@ class LetsCodeApp(App):
         if not self.current_problem_markdown:
             self.notify("Problem is still loading.", severity="warning")
             return
+
+        try:
+            await self.refresh_solution_context()
+        except Exception:
+            pass
 
         self.chat_entries.append(ChatEntry("user", message))
         pending_index = len(self.chat_entries)
@@ -1145,6 +1322,14 @@ class LetsCodeApp(App):
             )
 
         chat_container.scroll_end(animate=False)
+
+    async def clear_chat_history(self) -> None:
+        self.chat_entries = []
+        if self.agent is not None:
+            self.agent.clear_chat_history()
+
+        await self._render_chat_log()
+        self.notify("Chat history cleared.")
 
     async def on_prompt_input_submitted(self, event: PromptInput.Submitted) -> None:
         """Handle user input."""

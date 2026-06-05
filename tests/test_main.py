@@ -220,6 +220,36 @@ class SlashCommandTest(unittest.TestCase):
         self.assertTrue(app.handle_slash_command("/random"))
         self.assertEqual(len(workers), 1)
 
+    def test_solve_slash_command_starts_solve_worker(self) -> None:
+        app = LetsCodeApp()
+        workers: list[object] = []
+
+        def run_worker(work: object, *args: object, **kwargs: object) -> object:
+            workers.append(work)
+            if inspect.iscoroutine(work):
+                work.close()
+            return work
+
+        app.run_worker = run_worker  # type: ignore[method-assign]
+
+        self.assertTrue(app.handle_slash_command("/solve"))
+        self.assertEqual(len(workers), 1)
+
+    def test_clear_slash_command_starts_clear_worker(self) -> None:
+        app = LetsCodeApp()
+        workers: list[object] = []
+
+        def run_worker(work: object, *args: object, **kwargs: object) -> object:
+            workers.append(work)
+            if inspect.iscoroutine(work):
+                work.close()
+            return work
+
+        app.run_worker = run_worker  # type: ignore[method-assign]
+
+        self.assertTrue(app.handle_slash_command("/clear"))
+        self.assertEqual(len(workers), 1)
+
     def test_unknown_slash_command_is_consumed(self) -> None:
         app = LetsCodeApp()
         notifications: list[tuple[str, str | None]] = []
@@ -235,7 +265,7 @@ class SlashCommandTest(unittest.TestCase):
             [
                 (
                     "Unknown command: /typo. Available commands: "
-                    "/problem, /new, /hint, /fix, /reset, /random",
+                    "/problem, /new, /hint, /fix, /solve, /clear, /reset, /random",
                     "warning",
                 )
             ],

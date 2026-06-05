@@ -30,7 +30,8 @@ class LetsCodeAgent:
     You have access to tools for the currently loaded problem:
     - get_current_problem_context: read the active problem statement and metadata.
     - get_existing_hints: read hints that were already fetched or generated.
-    - get_current_solution_code: read the active Python solution file.
+    - read_user_solution: read the user's active Python solution file.
+    - get_current_solution_code: legacy alias for read_user_solution.
     - get_last_judge_output: read the latest judge/test output.
     - record_solution_attempt: increment the user's solution-attempt counter.
 
@@ -88,6 +89,9 @@ class LetsCodeAgent:
         self.state.current_solution_code = solution_code
         self.state.last_judge_output = judge_output
 
+    def clear_chat_history(self) -> None:
+        self.state.messages.clear()
+
     def chat(self, user_text: str) -> str:
         return self._invoke(user_text)
 
@@ -102,13 +106,25 @@ class LetsCodeAgent:
         self.state.generated_hints.append(hint)
         return hint
 
+    def solve_problem(self) -> str:
+        response = self._invoke(
+            "Solve the active coding problem. Use the get_current_problem_context "
+            "and read_user_solution tools before answering so you can account for "
+            "any work the user already has. Return only Python code for the "
+            "complete solution file, with no Markdown fences or explanation."
+        )
+        solved_code = extract_python_code(response)
+        self.state.current_solution_code = solved_code
+        return solved_code
+
     def fix_solution(self, suite: str) -> str:
         self.state.attempts_count += 1
         response = self._invoke(
             "Fix the current Python solution for the active coding problem. "
-            f"The failing suite is {suite}. Use the current-problem, current-solution, "
-            "and judge-output tools before answering. Return only corrected Python "
-            "code for the complete solution file, with no Markdown fences or explanation."
+            f"The failing suite is {suite}. Use the get_current_problem_context, "
+            "read_user_solution, and get_last_judge_output tools before answering. "
+            "Return only corrected Python code for the complete solution file, with "
+            "no Markdown fences or explanation."
         )
         fixed_code = extract_python_code(response)
         self.state.current_solution_code = fixed_code
@@ -168,6 +184,12 @@ def extract_python_code(content: str) -> str:
 
 
 def tool_factory(state: LetsCodeAgentState) -> list[BaseTool]:
+    def current_solution_text() -> str:
+        if not state.current_solution_code:
+            return "No solution code is currently loaded."
+
+        return state.current_solution_code
+
     @tool
     def get_current_problem_context() -> str:
         """Return the active coding problem statement and metadata."""
@@ -203,12 +225,14 @@ def tool_factory(state: LetsCodeAgentState) -> list[BaseTool]:
         return "\n\n".join(hints)
 
     @tool
+    def read_user_solution() -> str:
+        """Return the user's active Python solution code."""
+        return current_solution_text()
+
+    @tool
     def get_current_solution_code() -> str:
         """Return the active Python solution code."""
-        if not state.current_solution_code:
-            return "No solution code is currently loaded."
-
-        return state.current_solution_code
+        return current_solution_text()
 
     @tool
     def get_last_judge_output() -> str:
@@ -227,6 +251,7 @@ def tool_factory(state: LetsCodeAgentState) -> list[BaseTool]:
     return [
         get_current_problem_context,
         get_existing_hints,
+        read_user_solution,
         get_current_solution_code,
         get_last_judge_output,
         record_solution_attempt,
